@@ -6,6 +6,7 @@
 #include "freertos/task.h"
 #include "esp_system.h"
 #include "esp_log.h"
+#include "esp_timer.h"
 #include "driver/gpio.h"
 #include "driver/i2c.h"
 #include "WS2812.h"
@@ -41,9 +42,16 @@ static ws2812_t *strip = nullptr;
 static VL53L0X *tof_sensor = nullptr;
 static uint16_t sensor_distance = 200;
 static game_mode_t current_mode = MENU;  // Start with menu
-static int menu_selection = 0;
+static int menu_selection = -1;  // -1 means no selection (out of range)
+static int last_stable_selection = -1;
+static uint32_t selection_start_time = 0;
 static bool sensor_initialized = false;
 static bool tof_debug_mode = false;  // Set to true for detailed sensor output
+
+// Menu selection configuration
+#define MIN_SELECTION_DISTANCE 100  // Minimum distance for valid selection (mm)
+#define MAX_SELECTION_DISTANCE 350  // Maximum distance for valid selection (mm)
+#define SELECTION_HOLD_TIME 5000    // Time to hold selection to confirm (ms)
 
 // Function prototypes
 void init_hardware(void);
@@ -56,6 +64,8 @@ int get_sensor_position(void);
 void draw_menu(void);
 void print_game_legend(game_mode_t game);
 void test_matrix_mapping(void);
+void show_transition_screen(const char* text, uint8_t r, uint8_t g, uint8_t b, int duration_ms);
+void show_game_over_screen(int score, int high_score);
 void run_pong(void);
 void run_flappy(void);
 void run_catch(void);
@@ -410,20 +420,186 @@ void draw_menu(void) {
         int x = (game % 2) * 8 + 2;
         int y = (game / 2) * 8 + 2;
 
-        if (game == menu_selection) {
-            draw_rect(x, y, 4, 4, colors[game][0], colors[game][1], colors[game][2], true);
+        if (game == menu_selection && menu_selection != -1) {
+            // Calculate brightness based on selection progress
+            float progress = 0;
+            if (selection_start_time > 0) {
+                uint32_t elapsed = esp_timer_get_time() / 1000 - selection_start_time;
+                progress = (float)elapsed / SELECTION_HOLD_TIME;
+                if (progress > 1.0) progress = 1.0;
+            }
+
+            // Interpolate between dim and full brightness
+            uint8_t r = (uint8_t)(colors[game][0] * (0.3 + 0.7 * progress));
+            uint8_t g = (uint8_t)(colors[game][1] * (0.3 + 0.7 * progress));
+            uint8_t b = (uint8_t)(colors[game][2] * (0.3 + 0.7 * progress));
+
+            draw_rect(x, y, 4, 4, r, g, b, true);
         } else {
             draw_rect(x, y, 4, 4, 20, 20, 20, true);
         }
     }
 
-    // Draw selection border
-    if (menu_selection < 4) {
+    // Draw selection border (only if in valid range)
+    if (menu_selection >= 0 && menu_selection < 4) {
         int x = (menu_selection % 2) * 8;
         int y = (menu_selection / 2) * 8;
-        draw_rect(x, y, 8, 8, 255, 255, 255, false);
+
+        // Pulse the border brightness based on selection progress
+        float progress = 0;
+        if (selection_start_time > 0) {
+            uint32_t elapsed = esp_timer_get_time() / 1000 - selection_start_time;
+            progress = (float)elapsed / SELECTION_HOLD_TIME;
+            if (progress > 1.0) progress = 1.0;
+        }
+        uint8_t brightness = (uint8_t)(100 + 155 * progress);
+        draw_rect(x, y, 8, 8, brightness, brightness, brightness, false);
     }
 
+    // Draw distance indicator (top row shows if in valid range)
+    if (sensor_distance >= MIN_SELECTION_DISTANCE && sensor_distance <= MAX_SELECTION_DISTANCE) {
+        // Green indicator for valid range
+        set_pixel(0, 0, 0, 255, 0);
+        set_pixel(15, 0, 0, 255, 0);
+    } else {
+        // Red indicator for out of range
+        set_pixel(0, 0, 255, 0, 0);
+        set_pixel(15, 0, 255, 0, 0);
+    }
+
+    show_display();
+}
+
+// Transition screen with animated text
+void show_transition_screen(const char* text, uint8_t r, uint8_t g, uint8_t b, int duration_ms) {
+    int frames = duration_ms / 50;  // 50ms per frame
+
+    for (int frame = 0; frame < frames; frame++) {
+        clear_display();
+
+        // Calculate fade effect
+        float progress = (float)frame / frames;
+        float brightness = 1.0;
+
+        // Fade in for first 30%, full brightness for middle 40%, fade out for last 30%
+        if (progress < 0.3) {
+            brightness = progress / 0.3;
+        } else if (progress > 0.7) {
+            brightness = (1.0 - progress) / 0.3;
+        }
+
+        // Simple text display - show game name with animation
+        if (strcmp(text, "PONG") == 0) {
+            // Draw P-O-N-G letters
+            int spacing = 3;
+            int start_x = 2;
+
+            // Animate letters appearing one by one
+            int visible_letters = (frame * 4) / (frames / 2);
+            if (visible_letters > 4) visible_letters = 4;
+
+            for (int i = 0; i < visible_letters; i++) {
+                int x = start_x + i * spacing;
+                uint8_t br = r * brightness;
+                uint8_t bg = g * brightness;
+                uint8_t bb = b * brightness;
+
+                // Draw simple 2x3 letters
+                switch(text[i]) {
+                    case 'P':
+                        set_pixel(x, 6, br, bg, bb);
+                        set_pixel(x, 7, br, bg, bb);
+                        set_pixel(x, 8, br, bg, bb);
+                        set_pixel(x+1, 6, br, bg, bb);
+                        set_pixel(x+1, 7, br, bg, bb);
+                        break;
+                    case 'O':
+                        set_pixel(x, 6, br, bg, bb);
+                        set_pixel(x, 7, br, bg, bb);
+                        set_pixel(x, 8, br, bg, bb);
+                        set_pixel(x+1, 6, br, bg, bb);
+                        set_pixel(x+1, 8, br, bg, bb);
+                        break;
+                    case 'N':
+                        set_pixel(x, 6, br, bg, bb);
+                        set_pixel(x, 7, br, bg, bb);
+                        set_pixel(x, 8, br, bg, bb);
+                        set_pixel(x+1, 6, br, bg, bb);
+                        set_pixel(x+1, 8, br, bg, bb);
+                        break;
+                    case 'G':
+                        set_pixel(x, 6, br, bg, bb);
+                        set_pixel(x, 7, br, bg, bb);
+                        set_pixel(x, 8, br, bg, bb);
+                        set_pixel(x+1, 6, br, bg, bb);
+                        set_pixel(x+1, 8, br, bg, bb);
+                        break;
+                }
+            }
+        } else {
+            // Generic transition - expanding circle
+            float radius = 8.0 * progress;
+            for (int y = 0; y < 16; y++) {
+                for (int x = 0; x < 16; x++) {
+                    float dist = sqrt((x - 7.5) * (x - 7.5) + (y - 7.5) * (y - 7.5));
+                    if (dist <= radius && dist >= radius - 1.5) {
+                        set_pixel(x, y, r * brightness, g * brightness, b * brightness);
+                    }
+                }
+            }
+        }
+
+        show_display();
+        vTaskDelay(50 / portTICK_PERIOD_MS);
+    }
+
+    clear_display();
+    show_display();
+}
+
+// Game over screen with score display
+void show_game_over_screen(int score, int high_score) {
+    // Animate "GAME OVER" text with score
+    for (int frame = 0; frame < 40; frame++) {  // 2 seconds at 50ms per frame
+        clear_display();
+
+        // Flash effect
+        float brightness = (frame % 10 < 5) ? 1.0 : 0.5;
+
+        // Draw "GAME" on top
+        draw_rect(3, 2, 10, 3, 255 * brightness, 0, 0, false);
+
+        // Draw "OVER" below
+        draw_rect(3, 6, 10, 3, 255 * brightness, 0, 0, false);
+
+        // Show score at bottom (simple number display)
+        if (score >= 0 && frame > 10) {
+            // Draw score indicator
+            for (int i = 0; i < score && i < 16; i++) {
+                set_pixel(i, 14, 0, 255, 0);  // Green dots for score
+            }
+
+            // Flash high score indicator if new high score
+            if (score > high_score && (frame % 6 < 3)) {
+                draw_rect(0, 12, 16, 1, 255, 255, 0, true);  // Yellow line for new high score
+            }
+        }
+
+        show_display();
+        vTaskDelay(50 / portTICK_PERIOD_MS);
+    }
+
+    // Final fade out
+    for (int brightness = 255; brightness >= 0; brightness -= 15) {
+        clear_display();
+        float b = brightness / 255.0;
+        draw_rect(3, 2, 10, 3, 255 * b, 0, 0, false);
+        draw_rect(3, 6, 10, 3, 255 * b, 0, 0, false);
+        show_display();
+        vTaskDelay(30 / portTICK_PERIOD_MS);
+    }
+
+    clear_display();
     show_display();
 }
 
@@ -536,6 +712,7 @@ void render_pong(void) {
 
 void run_pong(void) {
     static bool initialized = false;
+    static int high_score = 0;
     if (!initialized) {
         init_pong();
         print_game_legend(PONG);
@@ -546,7 +723,12 @@ void run_pong(void) {
     render_pong();
 
     if (pong.game_over) {
-        vTaskDelay(3000 / portTICK_PERIOD_MS);
+        // Determine winner and score
+        int final_score = pong.player_score;
+        if (final_score > high_score) {
+            high_score = final_score;
+        }
+        show_game_over_screen(final_score, high_score);
         current_mode = MENU;
         initialized = false;
     }
@@ -567,12 +749,16 @@ void run_flappy(void) {
     }
 
     if (game_over) {
-        vTaskDelay(2000 / portTICK_PERIOD_MS);
+        static int score = 0;
+        static int high_score = 0;
+        if (score > high_score) high_score = score;
+        show_game_over_screen(score, high_score);
         current_mode = MENU;
         bird_y = 8;
         bird_vy = 0;
         pipe_x = 16;
         game_over = false;
+        score = 0;
         initialized = false;
         return;
     }
@@ -630,6 +816,7 @@ void run_catch(void) {
     static int lives = 3;
     static int score = 0;
     static bool initialized = false;
+    static int high_score = 0;
 
     if (!initialized) {
         print_game_legend(CATCH);
@@ -637,7 +824,8 @@ void run_catch(void) {
     }
 
     if (lives <= 0) {
-        vTaskDelay(2000 / portTICK_PERIOD_MS);
+        if (score > high_score) high_score = score;
+        show_game_over_screen(score, high_score);
         current_mode = MENU;
         lives = 3;
         score = 0;
@@ -693,11 +881,14 @@ void run_invaders(void) {
     static int bullet_y = -1;
     static int invader_y = 0;
     static bool initialized = false;
+    static int score = 0;
+    static int high_score = 0;
 
     if (!initialized) {
         for (int i = 0; i < 20; i++) {
             invaders[i] = 1;
         }
+        score = 0;
         print_game_legend(INVADERS);
         initialized = true;
     }
@@ -726,6 +917,7 @@ void run_invaders(void) {
                     bullet_y >= inv_y && bullet_y < inv_y + 2) {
                     invaders[i] = 0;
                     bullet_y = -1;
+                    score++;  // Increment score for each invader destroyed
                     break;
                 }
             }
@@ -741,7 +933,9 @@ void run_invaders(void) {
         }
     }
     if (!any_alive) {
-        vTaskDelay(2000 / portTICK_PERIOD_MS);
+        // Victory! All invaders destroyed
+        if (score > high_score) high_score = score;
+        show_game_over_screen(score, high_score);
         current_mode = MENU;
         initialized = false;
         return;
@@ -785,24 +979,89 @@ void game_task(void *pvParameters) {
         }
 
         switch (current_mode) {
-            case MENU:
-                menu_selection = get_sensor_position() / 4;
-                if (menu_selection > 3) menu_selection = 3;
-                draw_menu();
+            case MENU: {
+                // Check if hand is in valid range
+                if (sensor_distance >= MIN_SELECTION_DISTANCE && sensor_distance <= MAX_SELECTION_DISTANCE) {
+                    // Calculate selection based on position
+                    int new_selection = get_sensor_position() / 4;
+                    if (new_selection > 3) new_selection = 3;
 
-                // Simple selection: wave hand quickly to select
-                static uint16_t last_dist = 200;
-                if (abs((int)(sensor_distance - last_dist)) > 100) {
-                    switch (menu_selection) {
-                        case 0: current_mode = PONG; break;
-                        case 1: current_mode = FLAPPY; break;
-                        case 2: current_mode = CATCH; break;
-                        case 3: current_mode = INVADERS; break;
+                    // Check if selection changed
+                    if (new_selection != last_stable_selection) {
+                        // Selection changed, reset timer
+                        last_stable_selection = new_selection;
+                        selection_start_time = esp_timer_get_time() / 1000;
+                        menu_selection = new_selection;
+
+                        if (tof_debug_mode) {
+                            ESP_LOGI(TAG, "Menu selection started: %d (hold for 5s to confirm)", menu_selection);
+                        }
+                    } else {
+                        // Selection stable, check if held long enough
+                        uint32_t current_time = esp_timer_get_time() / 1000;
+                        uint32_t elapsed = current_time - selection_start_time;
+
+                        if (elapsed >= SELECTION_HOLD_TIME) {
+                            // Selection confirmed!
+                            ESP_LOGI(TAG, "Selection confirmed after 5 seconds!");
+
+                            // Show transition screen based on selected game
+                            const char* game_name = "";
+                            uint8_t r = 255, g = 255, b = 255;
+
+                            switch (menu_selection) {
+                                case 0:
+                                    game_name = "PONG";
+                                    r = 255; g = 0; b = 0;  // Red
+                                    current_mode = PONG;
+                                    break;
+                                case 1:
+                                    game_name = "FLAPPY";
+                                    r = 255; g = 255; b = 0;  // Yellow
+                                    current_mode = FLAPPY;
+                                    break;
+                                case 2:
+                                    game_name = "CATCH";
+                                    r = 0; g = 255; b = 0;  // Green
+                                    current_mode = CATCH;
+                                    break;
+                                case 3:
+                                    game_name = "INVADERS";
+                                    r = 0; g = 255; b = 255;  // Cyan
+                                    current_mode = INVADERS;
+                                    break;
+                            }
+
+                            // Show transition animation
+                            show_transition_screen(game_name, r, g, b, 1500);
+
+                            ESP_LOGI(TAG, "Starting game: %d", current_mode);
+
+                            // Reset for next time
+                            menu_selection = -1;
+                            last_stable_selection = -1;
+                            selection_start_time = 0;
+                        } else if (elapsed % 1000 < 50) {  // Log progress every second
+                            if (tof_debug_mode) {
+                                ESP_LOGI(TAG, "Hold progress: %.1f seconds", elapsed / 1000.0);
+                            }
+                        }
                     }
-                    ESP_LOGI(TAG, "Selected game: %d", current_mode);
+                } else {
+                    // Hand out of range - reset selection
+                    if (menu_selection != -1) {
+                        if (tof_debug_mode) {
+                            ESP_LOGI(TAG, "Hand out of range (%dmm) - selection cancelled", sensor_distance);
+                        }
+                    }
+                    menu_selection = -1;
+                    last_stable_selection = -1;
+                    selection_start_time = 0;
                 }
-                last_dist = sensor_distance;
+
+                draw_menu();
                 break;
+            }
 
             case PONG:
                 run_pong();
