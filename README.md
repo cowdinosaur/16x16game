@@ -13,7 +13,7 @@ An interactive multi-game system for 16x16 WS2812 LED matrix controlled by ESP32
 
 | Component | Pin | GPIO |
 |-----------|-----|------|
-| WS2812 Data | D2 | GPIO 2 |
+| WS2812 Data | D2 | GPIO 10 |
 | ToF SDA | D8 | GPIO 8 |
 | ToF SCL | D9 | GPIO 9 |
 
